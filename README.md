@@ -11,16 +11,10 @@
 後續接手對程式碼進行調整與增加功能<br>
 
 範例:
-  ## 標準掃描
+  ## 使用預設報告資料夾(Report)
   `python ip_scanner.py ip_list.txt`
   
-  ## 快速掃描
-  `python ip_scanner.py ip_list.txt --mode quick --workers 10`
+  ## 自訂報告資料夾名稱
+  `python ip_scanner.py ip_list.txt reports`
   
-  ## 完整掃描
-  `python ip_scanner.py ip_list.txt --mode full --workers 3`
-  
-  ## 關鍵服務掃描
-  `python ip_scanner.py ip_list.txt --mode critical --workers 15`
-
   ip_lists.txt放目標清單的純文字檔
