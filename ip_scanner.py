@@ -1,736 +1,811 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EASM 外部攻擊面掃描系統 - 整合優化版
-整合兩腳本優點：先探開放 port → 再深度漏洞掃描
-支援並行、多工作表美化報告、服務風險評估、地理位置等
+EASM (External Attack Surface Management) 掃描工具
+使用 python-nmap、openpyxl 和 requests 進行掃描並產出多工作表 Excel 報告
+支援兩階段掃描模式與多執行緒並行處理
 """
 
 import nmap
-import re
-import sys
-import time
-import requests
-from datetime import datetime
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+import requests
+import json
+import sys
+import os
+from datetime import datetime
+from collections import defaultdict
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import re
 
-class EnhancedIPScanner:
-    def __init__(self, ip_list_file, output_dir="scan_results", max_workers=5):
-        self.ip_list_file = ip_list_file
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.max_workers = max_workers
-        self.nm = nmap.PortScanner()
-        self.geo_cache = {}
-        self.lock = Lock()
+# 常數定義
+HISTORY_FILE = 'scan_history.json'
+WEB_PORTS = [80, 443, 8080, 8443, 8000, 8888]
+IP_API_URL = 'http://ip-api.com/json/{}'
+REPORT_DIR_DEFAULT = 'Report'  # 新增：預設報告資料夾名稱
 
-        self.severity_mapping = {
-            'CRITICAL': {'level': 5, 'color': 'C00000'},
-            'HIGH':     {'level': 4, 'color': 'FF0000'},
-            'MEDIUM':   {'level': 3, 'color': 'FFC000'},
-            'LOW':      {'level': 2, 'color': 'FFFF00'},
-            'INFO':     {'level': 1, 'color': '00B0F0'}
-        }
+# 多執行緒設定（可在程式開頭調整）
+MAX_WORKERS = 1  # 預設 1 個執行緒，可根據需求調整（建議 5-10）
 
-    def load_ip_list(self):
-        try:
-            with open(self.ip_list_file, 'r') as f:
-                ips = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-            print(f"[+] 載入 {len(ips)} 個 IP")
-            return ips
-        except Exception as e:
-            print(f"[-] 讀取失敗: {e}")
-            sys.exit(1)
+
+class EASMScanner:
+
+    def __init__(self, target_file, report_dir):
+        """初始化掃描器"""
+        self.target_file = target_file
+        self.report_dir = report_dir
+        # 確保報告資料夾存在
+        os.makedirs(self.report_dir, exist_ok=True)
+        self.scan_results = []
+        # 載入歷史掃描記錄
+        self.history = self.load_history()
+        # 漏洞清單
+        self.vulnerabilities = []
+        # 變動項目
+        self.changes = []
+        # Port 開啟統計
+        self.port_stats = defaultdict(lambda: {'count': 0, 'service': ''})
+        # 用於執行緒安全的資料寫入
+        self.lock = threading.Lock()  
+        
+    def load_history(self):
+        """載入歷史掃描記錄"""
+        history_path = os.path.join(self.report_dir, HISTORY_FILE)
+        if os.path.exists(history_path):
+            try:
+                with open(history_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"警告：無法讀取歷史記錄：{e}")
+                return {}
+        return {}
+    
+    def save_history(self):
+        """儲存歷史掃描記錄"""
+        history_data = {}
+        for result in self.scan_results:
+            ip = result['ip']
+            history_data[ip] = {
+                'ports': result['ports'],
+                'services': result['services'],
+                'scan_time': result['scan_time']
+            }
+        
+        history_path = os.path.join(self.report_dir, HISTORY_FILE)
+        with open(history_path, 'w', encoding='utf-8') as f:
+            json.dump(history_data, f, ensure_ascii=False, indent=2)
 
     def get_geo_info(self, ip):
-        if ip in self.geo_cache:
-            return self.geo_cache[ip]
+        """查詢 IP 地理位置與 ISP"""
         try:
-            resp = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp,as", timeout=6).json()
-            if resp.get('status') == 'success':
-                info = {
-                    'country': resp.get('country', 'Unknown'),
-                    'city': resp.get('city', 'Unknown'),
-                    'isp': resp.get('isp', 'Unknown'),
-                    'asn': resp.get('as', 'Unknown')
+            response = requests.get(IP_API_URL.format(ip), timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                return {
+                    'country': data.get('country', 'N/A'),
+                    'region': data.get('regionName', 'N/A'),
+                    'city': data.get('city', 'N/A'),
+                    'isp': data.get('isp', 'N/A'),
+                    'org': data.get('org', 'N/A')
                 }
-                self.geo_cache[ip] = info
-                return info
-        except: pass
-        default = {'country': 'Unknown', 'city': 'Unknown', 'isp': 'Unknown', 'asn': 'Unknown'}
-        self.geo_cache[ip] = default
-        return default
-
-    def scan_single_ip(self, ip):
-        print(f"\n[*] 掃描 {ip} ...")
+        except Exception as e:
+            print(f"警告：無法查詢 {ip} 的地理位置：{e}")
+        return {
+            'country': 'N/A',
+            'region': 'N/A',
+            'city': 'N/A',
+            'isp': 'N/A',
+            'org': 'N/A'
+        }
+    
+    def fast_scan(self, ip):
+        """第一階段：快速全 Port 掃描（1-65535）"""
+        nm = nmap.PortScanner()
+        open_ports = []
+        
+        try:
+            print(f"  [+] [{ip}] 第一階段：快速全 Port 掃描中...")
+            # 使用 -p 1-65535 --open -T4 進行快速掃描
+            nm.scan(ip, arguments='-p 1-65535 --open -T4')
+            
+            if ip in nm.all_hosts():
+                for proto in nm[ip].all_protocols():
+                    ports = nm[ip][proto].keys()
+                    for port in ports:
+                        port_info = nm[ip][proto][port]
+                        if port_info.get('state') == 'open':
+                            open_ports.append(port)
+            
+            print(f"  [+] [{ip}] 發現 {len(open_ports)} 個開啟的 Port")
+            return sorted(open_ports)
+            
+        except Exception as e:
+            print(f"  [!] [{ip}] 第一階段掃描錯誤：{e}")
+            return []
+    
+    def deep_scan(self, ip, open_ports):
+        """第二階段：針對性深度掃描（修正：加入 -Pn 跳過主機發現）"""
+        if not open_ports:
+            return None
+        
+        nm = nmap.PortScanner()
+        
+        # 如果 Port 數量過多，分批掃描（每批最多 100 個 Port）
+        MAX_PORTS_PER_SCAN = 100
+        
+        try:
+            if len(open_ports) > MAX_PORTS_PER_SCAN:
+                print(f"  [+] [{ip}] Port 數量較多 ({len(open_ports)} 個)，將分批掃描...")
+                # 分批處理
+                all_results_nm = None
+                for i in range(0, len(open_ports), MAX_PORTS_PER_SCAN):
+                    batch = open_ports[i:i+MAX_PORTS_PER_SCAN]
+                    print(f"  [+] [{ip}] 批次 {i//MAX_PORTS_PER_SCAN + 1}：掃描 {len(batch)} 個 Port...")
+                    
+                    ports_str = ','.join(map(str, batch))
+                    # 關鍵：加入 -Pn 跳過主機發現（因為第一階段已確認主機在線）
+                    # 不需要 --open，因為這些 Port 已經在第一階段確認是開啟的
+                    scan_args = f'-Pn -p {ports_str} -sV -sC --script=ssl-enum-ciphers,ssl-cert,http-security-headers,vuln --host-timeout 300s'
+                    
+                    try:
+                        batch_nm = nmap.PortScanner()
+                        batch_nm.scan(ip, arguments=scan_args)
+                        
+                        # 檢查掃描狀態
+                        if ip in batch_nm.all_hosts():
+                            all_results_nm = batch_nm  # 保存最後一次成功的掃描結果
+                            print(f"  [+] [{ip}] 批次 {i//MAX_PORTS_PER_SCAN + 1} 掃描成功")
+                        else:
+                            print(f"  [!] [{ip}] 批次 {i//MAX_PORTS_PER_SCAN + 1} 主機不在結果中")
+                    except Exception as e:
+                        print(f"  [!] [{ip}] 批次 {i//MAX_PORTS_PER_SCAN + 1} 掃描失敗：{e}")
+                        continue
+                
+                # 返回最後一次成功的掃描結果
+                if all_results_nm and ip in all_results_nm.all_hosts():
+                    return all_results_nm
+                else:
+                    print(f"  [!] [{ip}] 所有批次掃描均失敗或主機不在結果中")
+                    return None
+            else:
+                # Port 數量不多，直接掃描
+                print(f"  [+] [{ip}] 第二階段：深度掃描 {len(open_ports)} 個 Port...")
+                ports_str = ','.join(map(str, open_ports))
+                # 關鍵修正：加入 -Pn 參數跳過主機發現
+                # 不需要 --open，因為這些 Port 已經在第一階段確認是開啟的
+                scan_args = f'-Pn -p {ports_str} -sV -sC --script=ssl-enum-ciphers,ssl-cert,http-security-headers,vuln --host-timeout 300s'
+                
+                print(f"  [*] [{ip}] 執行 Nmap 掃描，參數：{scan_args}")
+                
+                try:
+                    nm.scan(ip, arguments=scan_args)
+                except nmap.PortScannerError as e:
+                    print(f"  [!] [{ip}] Nmap 掃描錯誤：{e}")
+                    return None
+                
+                # 檢查掃描狀態
+                if ip not in nm.all_hosts():
+                    print(f"  [!] [{ip}] 深度掃描後主機不在結果中")
+                    # 詳細診斷
+                    try:
+                        scan_info = nm.scaninfo()
+                        print(f"  [*] [{ip}] 掃描資訊：{scan_info}")
+                    except Exception as e:
+                        print(f"  [*] [{ip}] 無法獲取掃描資訊：{e}")
+                    
+                    # 可能的原因分析
+                    print(f"  [*] [{ip}] 可能原因：")
+                    print(f"      - 主機在兩次掃描之間離線")
+                    print(f"      - Port 狀態在掃描期間改變")
+                    print(f"      - Nmap 主機發現階段失敗（應已使用 -Pn 避免）")
+                    
+                    return None
+                
+                # 檢查是否有任何 Port 被掃描到
+                has_ports = False
+                port_count = 0
+                for proto in nm[ip].all_protocols():
+                    ports = list(nm[ip][proto].keys())
+                    port_count += len(ports)
+                    if ports:
+                        has_ports = True
+                
+                if not has_ports:
+                    print(f"  [!] [{ip}] 深度掃描未發現任何 Port 資料")
+                    print(f"  [*] [{ip}] 可能原因：所有 Port 在深度掃描時狀態已改變")
+                    return None
+                
+                print(f"  [+] [{ip}] 深度掃描完成，發現 {port_count} 個 Port")
+                return nm
+            
+        except nmap.PortScannerError as e:
+            print(f"  [!] [{ip}] Nmap PortScanner 錯誤：{e}")
+            return None
+        except Exception as e:
+            print(f"  [!] [{ip}] 第二階段掃描發生異常：{type(e).__name__}: {e}")
+            import traceback
+            print(f"  [*] 詳細錯誤：\n{traceback.format_exc()}")
+            return None
+    
+    def scan_target(self, ip, index, total):
+        """掃描單一目標（兩階段掃描）"""
+        print(f"\n[+] Scanning {ip} ({index}/{total})...")
+        
         result = {
             'ip': ip,
-            'hostname': '',
-            'status': 'down',
+            'scan_time': datetime.now().isoformat(),
             'ports': [],
+            'services': {},
             'vulnerabilities': [],
-            'os': 'Unknown'
+            'ssl_info': {},
+            'status': '第一次掃測',
+            'location': {},
+            'raw_output': ''
         }
-
-        geo = self.get_geo_info(ip)
-        result.update(geo)
-
+        
+        # 查詢地理位置
+        result['location'] = self.get_geo_info(ip)
+        time.sleep(0.5)  # 避免 API 請求過於頻繁
+        
         try:
-            # 第一階段：快速探測開放 port（使用預設 top 1000 + 關鍵高風險 port）
-            print(f" > 階段1: 探測開放 port")
-#            self.nm.scan(hosts=ip, arguments='--open -T4 --top-ports 1000 -p 22,80,443,8080,8443,3389,445,1433,3306,5432,6379')
-            self.nm.scan(hosts=ip, arguments='--open -T4 -p-')
-
-            if ip not in self.nm.all_hosts() or self.nm[ip].state() != 'up':
-                result['status'] = 'down'
-                result['vulnerabilities'].append({
-                    'port': 'N/A', 'service': 'host', 'script': 'scan',
-                    'severity': 'INFO', 'description': '主機無回應或被防火牆阻擋',
-                    'cve': 'N/A', 'recommendation': '確認網路連通性與防火牆規則'
-                })
-                return result
-
-            result['status'] = 'up'
-            open_ports = []
-            if 'tcp' in self.nm[ip]:
-                open_ports = list(self.nm[ip]['tcp'].keys())
-
+            # 第一階段：快速全 Port 掃描
+            open_ports = self.fast_scan(ip)
+            
             if not open_ports:
-                result['vulnerabilities'].append({
-                    'port': 'N/A', 'service': 'host', 'script': 'scan',
-                    'severity': 'INFO', 'description': '無開放 port',
-                    'cve': 'N/A', 'recommendation': '安全狀態良好'
-                })
+                result['status'] = '主機無回應或無開啟 Port'
+                result['raw_output'] = '未發現任何開啟的 Port'
+                with self.lock:
+                    self.scan_results.append(result)
                 return result
-
-            print(f" > 發現開放 port: {', '.join(map(str, sorted(open_ports)))}")
-
-            # 第二階段：針對開放 port 進行深度掃描
-            ports_str = ','.join(map(str, open_ports))
-            web_ports = {'80', '443', '8080', '8443'}
-            has_web = any(str(p) in web_ports for p in open_ports)
-
-            scripts = ["vulners"]
-            if has_web:
-                scripts.extend(["ssl-enum-ciphers", "http-security-headers"])
-
-            script_arg = ','.join(scripts)
-            args = f'-sV --version-intensity 9 --script {script_arg} -p {ports_str}'
-
-            print(f" > 階段2: 深度漏洞與服務分析")
-            self.nm.scan(hosts=ip, arguments=args)
-
-            # 解析結果
-            for port in open_ports:
-                if port not in self.nm[ip]['tcp']:
-                    continue
-                port_data = self.nm[ip]['tcp'][port]
-                service = port_data.get('name', 'unknown')
-                product = port_data.get('product', '')
-                version = port_data.get('version', '')
-
-                port_info = {
-                    'port': str(port),
-                    'protocol': 'tcp',
-                    'state': port_data.get('state', 'open'),
-                    'service': service,
-                    'product': product,
-                    'version': version,
-                    'scripts': []
-                }
-                result['ports'].append(port_info)
-
-                # vulners 原始輸出
-                if 'script' in port_data and 'vulners' in port_data['script']:
-                    vulners_out = port_data['script']['vulners'].strip()
-                    if vulners_out:
-                        cves = re.findall(r'CVE-\d{4}-\d{4,7}', vulners_out)
-                        max_cvss = max(self.extract_cvss(vulners_out) or [0])
-                        if max_cvss >= 9.0:
-                            severity = 'CRITICAL'
-                        elif max_cvss >= 7.0:
-                            severity = 'HIGH'
-                        elif max_cvss >= 4.0:
-                            severity = 'MEDIUM'
-                        elif max_cvss > 0:
-                            severity = 'LOW'
-                        else:
-                            severity = 'INFO'
-                        result['vulnerabilities'].append({
-                            'port': str(port),
-                            'service': service,
-                            'script': 'vulners',
-                            'severity': severity,
-                            'description': vulners_out[:800] + ('...' if len(vulners_out) > 800 else ''),
-                            'cve': ', '.join(sorted(set(cves))) if cves else 'N/A',
-                            'recommendation': '立即更新相關軟體至最新版本，參考 Vulners 詳細資訊'
-                        })
-
-                # SSL/TLS 檢查
-                if 'script' in port_data and 'ssl-enum-ciphers' in port_data['script']:
-                    ssl_out = port_data['script']['ssl-enum-ciphers']
-                    issues = []
-                    if any(p in ssl_out for p in ["SSLv2", "SSLv3"]):
-                        issues.append("極高風險：支援 SSLv2/v3")
-                    if any(p in ssl_out for p in ["TLSv1.0", "TLSv1.1"]):
-                        issues.append("過時協議：TLS 1.0/1.1")
-                    if issues:
-                        result['vulnerabilities'].append({
-                            'port': str(port),
-                            'service': 'https' if port in [443,8443] else 'http',
-                            'script': 'ssl-enum-ciphers',
-                            'severity': 'HIGH' if "極高風險" in ' '.join(issues) else 'MEDIUM',
-                            'description': ' | '.join(issues),
-                            'cve': 'N/A',
-                            'recommendation': '停用弱協議，僅支援 TLS 1.2+，使用強加密套件'
-                        })
-
-                # HSTS 檢查
-                if 'script' in port_data and 'http-security-headers' in port_data['script']:
-                    headers_out = port_data['script']['http-security-headers']
-                    if 'Strict-Transport-Security' not in headers_out:
-                        result['vulnerabilities'].append({
-                            'port': str(port),
-                            'service': 'http',
-                            'script': 'http-security-headers',
-                            'severity': 'MEDIUM',
-                            'description': '未啟用 HSTS (Strict-Transport-Security)',
-                            'cve': 'N/A',
-                            'recommendation': '在 Web 伺服器設定 HSTS 標頭，強制瀏覽器使用 HTTPS'
-                        })
-
-                # 服務基礎風險評估（從原腳本移植）
-                service_risk = self.assess_service_risk(str(port), service, product, version)
-                if service_risk:
-                    result['vulnerabilities'].append(service_risk)
-
-            # 主機名稱
-            if 'hostnames' in self.nm[ip] and self.nm[ip]['hostnames']:
-                result['hostname'] = self.nm[ip]['hostnames'][0].get('name', '')
-
-            # OS 偵測
-            if 'osmatch' in self.nm[ip] and self.nm[ip]['osmatch']:
-                result['os'] = self.nm[ip]['osmatch'][0].get('name', 'Unknown')
-
-        except Exception as e:
-            print(f"[-] {ip} 掃描異常: {e}")
-            result['vulnerabilities'].append({
-                'port': 'N/A', 'service': 'error', 'script': 'exception',
-                'severity': 'INFO', 'description': str(e), 'cve': 'N/A',
-                'recommendation': '檢查網路或防火牆'
-            })
-
-        return result
-
-    def extract_cvss(self, vulners_output):
-        scores = []
-        for line in vulners_output.splitlines():
-            m = re.search(r'\b(\d+\.\d)\b', line)
-            if m:
+            
+            # 第二階段：針對開啟的 Port 進行深度掃描
+            nm = self.deep_scan(ip, open_ports)
+            
+            if nm is None:
+                # 嘗試獲取更多錯誤資訊
+                error_msg = '深度掃描執行失敗'
                 try:
-                    scores.append(float(m.group(1)))
+                    # 檢查是否是 Port 數量過多導致的問題
+                    if len(open_ports) > 1000:
+                        error_msg = f'深度掃描失敗：開啟的 Port 數量過多 ({len(open_ports)} 個)，建議分批掃描'
+                    else:
+                        error_msg = f'深度掃描失敗：可能原因包括 Nmap 參數錯誤、掃描超時或主機無回應'
                 except:
                     pass
-        return scores
-
-    def assess_service_risk(self, port, service, product, version):
-        """評估服務層級的風險（從原腳本完整移植）"""
-        service_lower = service.lower()
-       
-        # 檢查 SSH 特殊邏輯
-        if service_lower == 'ssh':
-            version_str = version.lower() if version else ''
-            product_str = product.lower() if product else ''
+                
+                result['status'] = '深度掃描失敗'
+                result['raw_output'] = error_msg
+                # 即使深度掃描失敗，也記錄第一階段發現的 Port
+                result['ports'] = open_ports
+                with self.lock:
+                    self.scan_results.append(result)
+                return result
             
-            # 已知 patched 的 Ubuntu 版本（backport）
-            patched_ubuntu_patterns = [
-                'ubuntu-3ubuntu13.3', 'ubuntu-3ubuntu13.4',  # 24.04
-                'ubuntu-3ubuntu0.10',  # 22.04
-                # 可再加其他發行版 patched 版本
-            ]
-            
-            if any(patched in version_str or patched in product_str for patched in patched_ubuntu_patterns):
-                # 已 patched，降為 LOW 並移除 CVE
-                return {
-                    'port': port,
-                    'service': service,
-                    'script': 'service-risk-assessment',
-                    'severity': 'LOW',
-                    'description': f'SSH 服務在 port {port} 開啟 {f"({product} {version})" if product else ""} (已包含 CVE-2024-6387 補丁)',
-                    'cve': 'N/A',
-                    'recommendation': '停用密碼登入，僅允許金鑰認證，限制允許登入的使用者和 IP'
-                }
-            elif '9.8' in version_str or '9.9' in version_str:  # 新版已修
-                return {
-                    'port': port,
-                    'service': service,
-                    'script': 'service-risk-assessment',
-                    'severity': 'LOW',
-                    'description': f'SSH 服務在 port {port} 開啟 {f"({product} {version})" if product else ""} (不受 CVE-2024-6387 影響)',
-                    'cve': 'N/A',
-                    'recommendation': '保持最新版本，停用密碼登入'
-                }
-            else:
-                # 潛在 vulnerable
-                return {
-                    'port': port,
-                    'service': service,
-                    'script': 'service-risk-assessment',
-                    'severity': 'CRITICAL',
-                    'description': f'SSH 服務在 port {port} 開啟 ({product} {version}) - 可能易受 CVE-2024-6387 (regreSSHion) RCE 影響',
-                    'cve': 'CVE-2024-6387',
-                    'recommendation': '立即更新 OpenSSH 至 9.8p1 以上，或確認發行版已 backport 補丁；臨時減緩措施：設定 sshd_config LoginGraceTime 0 並重啟 sshd'
-                }
-       
-        # 高風險服務定義
-        high_risk_services = {
-            'telnet': {
-                'severity': 'CRITICAL',
-                'description': f'Telnet 服務在 port {port} 開啟，使用明文傳輸，可被竊聽',
-                'cve': 'N/A',
-                'recommendation': '立即停用 Telnet，改用 SSH (port 22) 進行加密遠端連線'
-            },
-            'ftp': {
-                'severity': 'HIGH',
-                'description': f'FTP 服務在 port {port} 開啟，使用明文傳輸帳密',
-                'cve': 'N/A',
-                'recommendation': '停用 FTP，改用 SFTP 或 FTPS。如需繼續使用，啟用 TLS 加密 (FTPS)'
-            },
-            'http': {
-                'severity': 'MEDIUM',
-                'description': f'HTTP 服務在 port {port} 未加密，資料可被中間人攔截',
-                'cve': 'N/A',
-                'recommendation': '啟用 HTTPS，取得並安裝 SSL/TLS 憑證，強制重導向至 HTTPS'
-            },
-            'smb': {
-                'severity': 'HIGH',
-                'description': f'SMB 服務在 port {port} 對外開放，可能遭受 EternalBlue 等攻擊',
-                'cve': 'CVE-2017-0144, CVE-2017-0145',
-                'recommendation': '限制 SMB 僅內網存取，停用 SMBv1，啟用簽章驗證，更新至最新版本'
-            },
-            'microsoft-ds': {
-                'severity': 'HIGH',
-                'description': f'Microsoft-DS (SMB) 服務在 port {port} 對外開放',
-                'cve': 'CVE-2017-0144, CVE-2017-0145',
-                'recommendation': '限制 SMB 僅內網存取，停用 SMBv1，啟用簽章驗證'
-            },
-            'netbios-ssn': {
-                'severity': 'MEDIUM',
-                'description': f'NetBIOS 服務在 port {port} 開啟，可能洩露系統資訊',
-                'cve': 'N/A',
-                'recommendation': '停用 NetBIOS，或限制僅內網存取'
-            },
-            'rdp': {
-                'severity': 'HIGH',
-                'description': f'RDP 服務在 port {port} 對外開放，常遭暴力破解攻擊',
-                'cve': 'CVE-2019-0708 (BlueKeep)',
-                'recommendation': '啟用網路層級驗證 (NLA)，使用多因素驗證 (MFA)，限制允許連線的 IP，更新至最新版本'
-            },
-            'ms-wbt-server': {
-                'severity': 'HIGH',
-                'description': f'RDP 服務在 port {port} 對外開放',
-                'cve': 'CVE-2019-0708 (BlueKeep)',
-                'recommendation': '啟用 NLA，使用 MFA，限制 IP 白名單'
-            },
-            'mysql': {
-                'severity': 'MEDIUM',
-                'description': f'MySQL 資料庫在 port {port} 對外曝露',
-                'cve': 'N/A',
-                'recommendation': '限制 MySQL 僅 localhost 或內網存取，使用強密碼，定期更新版本'
-            },
-            'ms-sql-s': {
-                'severity': 'MEDIUM',
-                'description': f'MS SQL Server 在 port {port} 對外曝露',
-                'cve': 'N/A',
-                'recommendation': '限制僅內網存取，啟用 Windows 驗證，加密連線，定期更新'
-            },
-            'postgresql': {
-                'severity': 'MEDIUM',
-                'description': f'PostgreSQL 資料庫在 port {port} 對外曝露',
-                'cve': 'N/A',
-                'recommendation': '限制僅內網或特定 IP 存取，使用強密碼，啟用 SSL 連線'
-            },
-            'mongodb': {
-                'severity': 'HIGH',
-                'description': f'MongoDB 在 port {port} 對外曝露，可能未啟用驗證',
-                'cve': 'N/A',
-                'recommendation': '啟用驗證機制，限制僅內網存取，使用防火牆規則'
-            },
-            'redis': {
-                'severity': 'HIGH',
-                'description': f'Redis 在 port {port} 對外曝露，預設無密碼保護',
-                'cve': 'N/A',
-                'recommendation': '設定強密碼 (requirepass)，綁定至 localhost，停用危險指令'
-            },
-            'vnc': {
-                'severity': 'HIGH',
-                'description': f'VNC 服務在 port {port} 開啟，可能使用弱加密',
-                'cve': 'N/A',
-                'recommendation': '使用 SSH 隧道加密 VNC 流量，或改用 RDP/其他加密遠端方案'
-            },
-            'smtp': {
-                'severity': 'MEDIUM',
-                'description': f'SMTP 服務在 port {port} 開啟，需檢查是否為開放轉發',
-                'cve': 'N/A',
-                'recommendation': '停用開放轉發 (Open Relay)，啟用 STARTTLS，設定 SPF/DKIM/DMARC'
-            },
-            'pop3': {
-                'severity': 'MEDIUM',
-                'description': f'POP3 服務在 port {port} 開啟，使用明文傳輸',
-                'cve': 'N/A',
-                'recommendation': '改用 POP3S (SSL/TLS 加密) 或 IMAP，停用明文 POP3'
-            },
-            'imap': {
-                'severity': 'MEDIUM',
-                'description': f'IMAP 服務在 port {port} 開啟，使用明文傳輸',
-                'cve': 'N/A',
-                'recommendation': '改用 IMAPS (SSL/TLS 加密)，停用明文 IMAP'
-            },
-            'elasticsearch': {
-                'severity': 'HIGH',
-                'description': f'Elasticsearch 在 port {port} 對外曝露',
-                'cve': 'N/A',
-                'recommendation': '限制僅內網存取，啟用 X-Pack 安全功能，使用驗證與加密'
-            },
-            'docker': {
-                'severity': 'CRITICAL',
-                'description': f'Docker API 在 port {port} 未加密對外開放，可被遠端控制',
-                'cve': 'N/A',
-                'recommendation': '啟用 TLS 驗證，限制僅內網存取，或使用 SSH 隧道'
-            },
-            'kubernetes': {
-                'severity': 'CRITICAL',
-                'description': f'Kubernetes API 在 port {port} 對外曝露',
-                'cve': 'N/A',
-                'recommendation': '啟用 RBAC，使用網路策略限制存取，啟用 TLS 驗證'
-            }
-        }
-       
-        # 檢查是否為高風險服務
-        if service_lower in high_risk_services:
-            risk_info = high_risk_services[service_lower]
-            return {
-                'port': port,
-                'service': service,
-                'script': 'service-risk-assessment',
-                'severity': risk_info['severity'],
-                'description': risk_info['description'],
-                'cve': risk_info['cve'],
-                'recommendation': risk_info['recommendation']
-            }
-       
-        # 檢查常見的高風險 port
-        risky_ports = {
-            '21': ('FTP', 'HIGH'),
-            '23': ('Telnet', 'CRITICAL'),
-            '69': ('TFTP', 'HIGH'),
-            '135': ('MS-RPC', 'MEDIUM'),
-            '139': ('NetBIOS', 'MEDIUM'),
-            '445': ('SMB', 'HIGH'),
-            '1433': ('MS-SQL', 'MEDIUM'),
-            '3306': ('MySQL', 'MEDIUM'),
-            '3389': ('RDP', 'HIGH'),
-            '5432': ('PostgreSQL', 'MEDIUM'),
-            '5900': ('VNC', 'HIGH'),
-            '6379': ('Redis', 'HIGH'),
-            '8080': ('HTTP-Proxy', 'LOW'),
-            '9200': ('Elasticsearch', 'HIGH'),
-            '27017': ('MongoDB', 'HIGH')
-        }
-       
-        if port in risky_ports and service_lower not in high_risk_services:
-            service_name, severity = risky_ports[port]
-            return {
-                'port': port,
-                'service': service or service_name,
-                'script': 'port-risk-assessment',
-                'severity': severity,
-                'description': f'Port {port} ({service_name}) 開啟，可能存在安全風險',
-                'cve': 'N/A',
-                'recommendation': f'檢視 {service_name} 服務的必要性，如非必要請關閉，或限制存取來源'
-            }
-       
-        return None
-
-    def scan_parallel(self, ip_list):
-        results = []
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(self.scan_single_ip, ip): ip for ip in ip_list}
-            for future in as_completed(futures):
-                try:
-                    res = future.result()
+            # 解析掃描結果
+            for proto in nm[ip].all_protocols():
+                ports = nm[ip][proto].keys()
+                for port in ports:
+                    port_info = nm[ip][proto][port]
+                    service_name = port_info.get('name', 'unknown')
+                    product = port_info.get('product', '')
+                    version = port_info.get('version', '')
+                    
+                    result['ports'].append(port)
+                    result['services'][str(port)] = {
+                        'name': service_name,
+                        'product': product,
+                        'version': version,
+                        'state': port_info.get('state', 'unknown'),
+                        'script_output': port_info.get('script', {})
+                    }
+                    
+                    # 統計 Port 開啟數量（執行緒安全）
                     with self.lock:
-                        results.append(res)
-                except Exception as e:
-                    print(f"[-] 處理異常: {e}")
-        return results
-
-    def generate_report(self, scan_results):
-        """產生Excel報告（從原腳本完整移植，包括所有美化）"""
+                        self.port_stats[port]['count'] += 1
+                        if not self.port_stats[port]['service']:
+                            self.port_stats[port]['service'] = service_name
+                    
+                    # 檢查漏洞
+                    self.check_vulnerabilities(ip, port, port_info, result)
+            
+            # 比對歷史記錄
+            self.compare_with_history(ip, result)
+            
+            # 儲存原始輸出
+            result['raw_output'] = str(nm[ip])
+            
+        except Exception as e:
+            print(f"  [!] [{ip}] 掃描時發生問題：{e}")
+            result['status'] = f'掃描錯誤：{str(e)}'
+            result['raw_output'] = str(e)
+        
+        # 執行緒安全地加入結果
+        with self.lock:
+            self.scan_results.append(result)
+        
+        return result
+    
+    def check_vulnerabilities(self, ip, port, port_info, result):
+        """檢查漏洞與安全問題"""
+        port_num = port
+        service_name = port_info.get('name', 'unknown')
+        product = port_info.get('product', '')
+        version = port_info.get('version', '')
+        script_output = port_info.get('script', {})
+        
+        # 檢查 SSL/TLS 問題
+        if port_num in [443, 8443] or 'ssl' in service_name.lower() or 'https' in service_name.lower():
+            ssl_info = script_output.get('ssl-enum-ciphers', '')
+            ssl_cert = script_output.get('ssl-cert', '')
+            
+            if ssl_info or ssl_cert:
+                result['ssl_info'][str(port_num)] = ssl_info or ssl_cert
+                # 檢查是否使用舊版 TLS
+                ssl_text = str(ssl_info) + str(ssl_cert)
+                if 'TLSv1.0' in ssl_text or 'TLSv1.1' in ssl_text:
+                    vuln = {
+                        'ip': ip,
+                        'port': port_num,
+                        'protocol': 'tcp',
+                        'service': service_name,
+                        'type': 'SSL/TLS 過時',
+                        'port_info': f'Port {port_num}',
+                        'description': '使用過時的 TLS 版本 (TLSv1.0/1.1)',
+                        'recommendation': '升級至 TLSv1.2 或更高版本'
+                    }
+                    with self.lock:
+                        self.vulnerabilities.append(vuln)
+                    result['vulnerabilities'].append(vuln)
+        
+        # 檢查 HTTP 安全標頭
+        if port_num in [80, 443, 8080, 8443, 8000, 8888]:
+            headers_info = script_output.get('http-security-headers', '')
+            hsts_info = script_output.get('http-hsts', '')
+            
+            if headers_info or hsts_info:
+                headers_text = str(headers_info) + str(hsts_info)
+                if 'Strict-Transport-Security' not in headers_text and 'HSTS' not in headers_text:
+                    vuln = {
+                        'ip': ip,
+                        'port': port_num,
+                        'protocol': 'tcp',
+                        'service': service_name,
+                        'type': 'HSTS 缺失',
+                        'port_info': f'Port {port_num}',
+                        'description': '缺少 HSTS (HTTP Strict Transport Security) 標頭',
+                        'recommendation': '在 Web 伺服器設定中加入 Strict-Transport-Security 標頭'
+                    }
+                    with self.lock:
+                        self.vulnerabilities.append(vuln)
+                    result['vulnerabilities'].append(vuln)
+        
+        # 檢查 Nmap 漏洞腳本結果
+        vuln_scripts = ['vuln', 'vulners', 'exploit']
+        for vuln_script in vuln_scripts:
+            if vuln_script in script_output:
+                vuln_data = script_output[vuln_script]
+                if isinstance(vuln_data, str) and ('CVE' in vuln_data or 'VULNERABLE' in vuln_data.upper()):
+                    # 提取 CVE 編號（如果有的話）
+                    cve_match = None
+                    if 'CVE-' in vuln_data:
+                        cve_pattern = r'CVE-\d{4}-\d{4,7}'
+                        matches = re.findall(cve_pattern, vuln_data)
+                        if matches:
+                            cve_match = ', '.join(matches[:3])  # 最多顯示 3 個 CVE
+                    
+                    description = vuln_data[:300] if len(vuln_data) > 300 else vuln_data
+                    if cve_match:
+                        description = f"CVE: {cve_match}\n{description}"
+                    
+                    vuln = {
+                        'ip': ip,
+                        'port': port_num,
+                        'protocol': 'tcp',
+                        'service': service_name,
+                        'type': 'CVE 漏洞',
+                        'port_info': f'Port {port_num}',
+                        'description': description,
+                        'recommendation': f'檢查並修補 {product} {version} 的已知漏洞'
+                    }
+                    with self.lock:
+                        self.vulnerabilities.append(vuln)
+                    result['vulnerabilities'].append(vuln)
+                    break  # 每個 Port 只記錄一次 CVE 漏洞
+        
+        # 檢查過時的服務版本
+        if product and version:
+            old_versions = ['1.0', '2.0', '3.0']
+            for old_ver in old_versions:
+                if old_ver in version and len(version) < 10:  # 避免誤判
+                    vuln = {
+                        'ip': ip,
+                        'port': port_num,
+                        'protocol': 'tcp',
+                        'service': service_name,
+                        'type': '過時版本',
+                        'port_info': f'Port {port_num}',
+                        'description': f'使用過時版本：{product} {version}',
+                        'recommendation': f'升級 {product} 至最新版本'
+                    }
+                    with self.lock:
+                        self.vulnerabilities.append(vuln)
+                    result['vulnerabilities'].append(vuln)
+                    break
+    
+    def compare_with_history(self, ip, current_result):
+        """與歷史記錄比對，找出變動"""
+        with self.lock:
+            if ip not in self.history:
+                current_result['status'] = '第一次掃測'
+                self.changes.append({
+                    'ip': ip,
+                    'type': '新增 IP',
+                    'details': '首次發現此 IP'
+                })
+                return
+            
+            old_data = self.history[ip]
+            old_ports = set(old_data.get('ports', []))
+            current_ports = set(current_result['ports'])
+            
+            # 檢查新增的 Port
+            new_ports = current_ports - old_ports
+            for port in new_ports:
+                self.changes.append({
+                    'ip': ip,
+                    'type': 'Port 開啟',
+                    'details': f'Port {port} 從關閉變為開啟'
+                })
+            
+            # 檢查關閉的 Port
+            closed_ports = old_ports - current_ports
+            for port in closed_ports:
+                self.changes.append({
+                    'ip': ip,
+                    'type': 'Port 關閉',
+                    'details': f'Port {port} 從開啟變為關閉'
+                })
+            
+            # 檢查服務版本變更
+            old_services = old_data.get('services', {})
+            current_services = current_result['services']
+            
+            for port in current_ports & old_ports:
+                port_str = str(port)
+                if port_str in old_services and port_str in current_services:
+                    old_service = old_services[port_str]
+                    current_service = current_services[port_str]
+                    
+                    old_version = f"{old_service.get('product', '')} {old_service.get('version', '')}".strip()
+                    current_version = f"{current_service.get('product', '')} {current_service.get('version', '')}".strip()
+                    
+                    if old_version != current_version:
+                        self.changes.append({
+                            'ip': ip,
+                            'type': '服務版本變更',
+                            'details': f'Port {port}: {old_version} -> {current_version}'
+                        })
+            
+            if not new_ports and not closed_ports:
+                current_result['status'] = '無變動'
+            else:
+                current_result['status'] = '有變動'
+    
+    def generate_excel_report(self):
+        """生成 Excel 報告"""
+        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        filename = f'EASM_Report_{timestamp}.xlsx'
+        report_path = os.path.join(self.report_dir, filename)
         wb = openpyxl.Workbook()
-       
-        # 建立工作表
-        ws_summary = wb.active
-        ws_summary.title = "掃描摘要"
-        ws_detail = wb.create_sheet("詳細結果")
-        ws_vuln = wb.create_sheet("漏洞清單")
-        ws_port = wb.create_sheet("Port開啟統計")
-        ws_risk = wb.create_sheet("風險評估")
-       
-        # 樣式定義
-        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-        header_font = Font(color="FFFFFF", bold=True)
-        border = Border(
-            left=Side(style='thin'),
-            right=Side(style='thin'),
-            top=Side(style='thin'),
-            bottom=Side(style='thin')
-        )
-       
-        # === 掃描摘要工作表 ===
-        summary_headers = ["項目", "數值", "說明"]
-        ws_summary.append(summary_headers)
-       
-        total_ips = len(scan_results)
-        total_vulnerabilities = sum(len(r['vulnerabilities']) for r in scan_results)
-        critical_count = sum(1 for r in scan_results for v in r['vulnerabilities'] if v['severity'] == 'CRITICAL')
-        high_count = sum(1 for r in scan_results for v in r['vulnerabilities'] if v['severity'] == 'HIGH')
-        medium_count = sum(1 for r in scan_results for v in r['vulnerabilities'] if v['severity'] == 'MEDIUM')
-        low_count = sum(1 for r in scan_results for v in r['vulnerabilities'] if v['severity'] == 'LOW')
-       
-        summary_data = [
-            ["掃描時間", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "報告產生時間"],
-            ["掃描IP總數", total_ips, "本次掃描的IP數量"],
-            ["線上主機數", sum(1 for r in scan_results if r['status'] == 'up'), "狀態為up的主機"],
-            ["發現漏洞總數", total_vulnerabilities, "所有漏洞總計"],
-            ["🔴 危急(Critical)", critical_count, "需立即處理"],
-            ["🟠 高危(High)", high_count, "優先修補"],
-            ["🟡 中危(Medium)", medium_count, "排程修補"],
-            ["🔵 低危(Low)", low_count, "例行維護"],
-            ["開啟Port總數", sum(len(r['ports']) for r in scan_results), "所有開啟的port"],
-            ["平均每主機Port數", round(sum(len(r['ports']) for r in scan_results) / max(total_ips, 1), 2), ""],
-            ["平均每主機漏洞數", round(total_vulnerabilities / max(total_ips, 1), 2), ""]
-        ]
-       
-        for row in summary_data:
-            ws_summary.append(row)
-       
-        self.format_sheet(ws_summary, header_fill, header_font, border)
-       
-        # === 詳細結果工作表 ===
-        detail_headers = ["IP位址", "主機名稱", "國家/地區", "城市", "電信商(ISP)", "ASN", "狀態", "作業系統", "開啟Port數", "漏洞數量", "最高風險等級", "總結建議"]
-        ws_detail.append(detail_headers)
-       
-        for result in scan_results:
-            # 計算最高風險等級
-            max_severity = 'INFO'
-            if result['vulnerabilities']:
-                severity_levels = [self.severity_mapping.get(v['severity'], {'level': 1})['level'] for v in result['vulnerabilities']]
-                max_level = max(severity_levels)
-                max_severity = [k for k, v in self.severity_mapping.items() if v['level'] == max_level][0]
-           
-            # 彙總修復建議（去除重複，並以換行分隔）
-            recommendations = set(v['recommendation'] for v in result['vulnerabilities'] if 'recommendation' in v)
-            summary_recommendation = '\n'.join(recommendations) if recommendations else '無特定建議'
-           
-            row_data = [
-                result['ip'],
-                result.get('hostname', 'N/A'),
-                result.get('country', 'Unknown'),
-                result.get('city', 'Unknown'),
-                result.get('isp', 'Unknown'),
-                result.get('asn', 'Unknown'),
-                result['status'],
-                result['os'],
-                len(result['ports']),
-                len(result['vulnerabilities']),
-                max_severity,
-                summary_recommendation
-            ]
-            ws_detail.append(row_data)
-           
-            # 根據風險等級標色
-            if max_severity in self.severity_mapping:
-                color = self.severity_mapping[max_severity]['color']
-                ws_detail.cell(row=ws_detail.max_row, column=11).fill = PatternFill(
-                    start_color=color, end_color=color, fill_type="solid"
-                )
-       
-        self.format_sheet(ws_detail, header_fill, header_font, border)
-        ws_detail.column_dimensions['L'].width = 60  # 調整總結建議欄寬
-       
-        # === 漏洞清單工作表 ===
-        vuln_headers = ["IP位址", "主機名稱", "Port", "服務", "漏洞嚴重程度", "檢測腳本", "CVE編號", "漏洞描述", "修復建議"]
-        ws_vuln.append(vuln_headers)
-       
-        for result in scan_results:
-            for vuln in result['vulnerabilities']:
-                row_data = [
-                    result['ip'],
-                    result.get('hostname', 'N/A'),
-                    vuln['port'],
-                    vuln['service'],
-                    vuln['severity'],
-                    vuln['script'],
-                    vuln.get('cve', 'N/A'),
-                    vuln['description'],
-                    vuln['recommendation']
-                ]
-                ws_vuln.append(row_data)
-               
-                # 根據嚴重程度設定顏色
-                severity_color = self.severity_mapping.get(vuln['severity'], {}).get('color', 'FFFFFF')
-                ws_vuln.cell(row=ws_vuln.max_row, column=5).fill = PatternFill(
-                    start_color=severity_color, end_color=severity_color, fill_type="solid"
-                )
-       
-        self.format_sheet(ws_vuln, header_fill, header_font, border)
-        ws_vuln.column_dimensions['H'].width = 50
-        ws_vuln.column_dimensions['I'].width = 40
-       
-        # === Port統計工作表 ===
-        port_stats = {}
-        for result in scan_results:
-            for port_info in result['ports']:
-                port_key = f"{port_info['port']}/{port_info['protocol']}"
-                service_name = port_info['service'] or 'unknown'
-               
-                if port_key not in port_stats:
-                    port_stats[port_key] = {'count': 0, 'service': service_name, 'ips': []}
-               
-                port_stats[port_key]['count'] += 1
-                port_stats[port_key]['ips'].append(result['ip'])
-       
-        port_headers = ["Port/協議", "服務名稱", "出現次數", "曝險比例", "受影響IP"]
-        ws_port.append(port_headers)
-       
-        for port, stats in sorted(port_stats.items(), key=lambda x: x[1]['count'], reverse=True):
-            exposure_rate = f"{(stats['count'] / total_ips * 100):.1f}%" if total_ips > 0 else "0%"
-            row_data = [
-                port,
-                stats['service'],
-                stats['count'],
-                exposure_rate,
-                ', '.join(stats['ips'][:10]) + ('...' if len(stats['ips']) > 10 else '')
-            ]
-            ws_port.append(row_data)
-       
-        self.format_sheet(ws_port, header_fill, header_font, border)
-        ws_port.column_dimensions['E'].width = 50
-       
-        # === 風險評估工作表 ===
-        risk_headers = ["風險類型", "風險等級", "影響主機數", "建議措施"]
-        ws_risk.append(risk_headers)
-       
-        # 高風險服務識別（從原腳本移植）
-        risky_services = {
-            'telnet': ('CRITICAL', '使用未加密協議'),
-            'ftp': ('HIGH', '使用未加密協議'),
-            'http': ('MEDIUM', '未使用加密傳輸'),
-            'smb': ('HIGH', '可能遭受勒索軟體攻擊'),
-            'rdp': ('HIGH', '常見暴力破解目標'),
-            'mysql': ('MEDIUM', '資料庫對外曝露'),
-            'mssql': ('MEDIUM', '資料庫對外曝露'),
-            'mongodb': ('HIGH', '資料庫對外曝露'),
-            'redis': ('HIGH', '快取資料庫對外曝露')
-        }
-       
-        for service, (severity, desc) in risky_services.items():
-            affected_hosts = [r['ip'] for r in scan_results for p in r['ports'] if service in p['service'].lower()]
-            if affected_hosts:
-                row_data = [
-                    f"{service.upper()} 服務曝露",
-                    severity,
-                    len(affected_hosts),
-                    f"{desc}，建議立即檢視：{', '.join(affected_hosts[:5])}"
-                ]
-                ws_risk.append(row_data)
-               
-                color = self.severity_mapping.get(severity, {}).get('color', 'FFFFFF')
-                ws_risk.cell(row=ws_risk.max_row, column=2).fill = PatternFill(
-                    start_color=color, end_color=color, fill_type="solid"
-                )
-       
-        self.format_sheet(ws_risk, header_fill, header_font, border)
-        ws_risk.column_dimensions['D'].width = 60
-       
+        
+        # 移除預設工作表
+        if 'Sheet' in wb.sheetnames:
+            wb.remove(wb['Sheet'])
+        
+        # 定義標題樣式
+        header_fill = PatternFill(start_color='CCCCCC', end_color='CCCCCC', fill_type='solid')
+        header_font = Font(bold=True, size=11)
+        
+        # 工作表 1: 掃描摘要
+        self.create_summary_sheet(wb, header_fill, header_font)
+        
+        # 工作表 2: 漏洞清單
+        self.create_vulnerability_sheet(wb, header_fill, header_font)
+        
+        # 工作表 3: 變動比對
+        self.create_change_log_sheet(wb, header_fill, header_font)
+        
+        # 工作表 4: Port 開啟統計
+        self.create_port_stats_sheet(wb, header_fill, header_font)
+        
+        # 工作表 5: 詳細資料
+        self.create_raw_data_sheet(wb, header_fill, header_font)
+        
         # 儲存檔案
-        output_file = self.output_dir / f"EASM_Enhanced_Report_{self.timestamp}.xlsx"
-        wb.save(output_file)
-        print(f"[+] 報告已產生: {output_file}")
-       
-        return output_file
-
-    def format_sheet(self, ws, header_fill, header_font, border):
-        """格式化工作表（從原腳本移植）"""
-        # 標題列格式
-        for cell in ws[1]:
+        wb.save(report_path)
+        print(f"\n報告已生成：{report_path}")
+        return report_path
+    
+    def create_summary_sheet(self, wb, header_fill, header_font):
+        """建立掃描摘要工作表"""
+        ws = wb.create_sheet('掃描摘要', 0)
+        
+        headers = ['掃描日期', '掃描 IP 總數', '發現風險 IP 數', '異動 IP 數', 
+                   '高風險漏洞總數', 'SSL/TLS 不合規數量']
+        
+        # 寫入標題
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = Alignment(horizontal='center', vertical='center')
-            cell.border = border
-       
-        # 所有儲存格加上框線
-        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=ws.max_column):
-            for cell in row:
-                cell.border = border
-                if cell.row > 1:
-                    cell.alignment = Alignment(vertical='top', wrap_text=True)
-       
-        # 自動調整欄寬
-        for column in ws.columns:
-            max_length = 0
-            column_letter = get_column_letter(column[0].column)
-           
-            for cell in column:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-           
-            adjusted_width = min(max_length + 2, 60)
-            ws.column_dimensions[column_letter].width = adjusted_width
-
+        
+        # 計算統計數據
+        scan_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        total_ips = len(self.scan_results)
+        risk_ips = len(set(v['ip'] for v in self.vulnerabilities))
+        changed_ips = len(set(c['ip'] for c in self.changes))
+        total_vulns = len(self.vulnerabilities)
+        ssl_non_compliant = len([v for v in self.vulnerabilities if 'SSL/TLS' in v['type']])
+        
+        # 寫入數據
+        data = [scan_date, total_ips, risk_ips, changed_ips, total_vulns, ssl_non_compliant]
+        for col, value in enumerate(data, 1):
+            cell = ws.cell(row=2, column=col, value=value)
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # 調整欄寬
+        for col in range(1, len(headers) + 1):
+            ws.column_dimensions[get_column_letter(col)].width = 20
+    
+    def create_vulnerability_sheet(self, wb, header_fill, header_font):
+        """建立漏洞清單工作表（Port 與描述分離）"""
+        ws = wb.create_sheet('漏洞清單', 1)
+        
+        # 修改欄位：將 Port 資訊從描述中分離出來
+        headers = ['IP Address', 'Port/Protocol', 'Service Name', '漏洞類型', 
+                   'Port', '詳細描述', '修補建議']
+        
+        # 寫入標題
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # 寫入漏洞數據
+        for row, vuln in enumerate(self.vulnerabilities, 2):
+            ws.cell(row=row, column=1, value=vuln['ip'])
+            ws.cell(row=row, column=2, value=f"{vuln['port']}/{vuln['protocol']}")
+            ws.cell(row=row, column=3, value=vuln['service'])
+            ws.cell(row=row, column=4, value=vuln['type'])
+            # Port 資訊（從 port_info 欄位取得，如果沒有則使用 port 欄位）
+            port_info = vuln.get('port_info', f"Port {vuln['port']}")
+            ws.cell(row=row, column=5, value=port_info)
+            # 詳細描述（已移除 Port 資訊）
+            ws.cell(row=row, column=6, value=vuln['description'])
+            ws.cell(row=row, column=7, value=vuln['recommendation'])
+        
+        # 調整欄寬
+        column_widths = [15, 15, 20, 20, 15, 50, 40]
+        for col, width in enumerate(column_widths, 1):
+            ws.column_dimensions[get_column_letter(col)].width = width
+        
+        # 設定文字自動換行
+        for row in range(2, len(self.vulnerabilities) + 2):
+            for col in range(1, 8):
+                ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical='top')
+    
+    def create_change_log_sheet(self, wb, header_fill, header_font):
+        """建立變動比對工作表"""
+        ws = wb.create_sheet('變動比對', 2)
+        
+        headers = ['IP Address', '變動類型', '變更詳情']
+        
+        # 寫入標題
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # 寫入變動數據
+        for row, change in enumerate(self.changes, 2):
+            ws.cell(row=row, column=1, value=change['ip'])
+            ws.cell(row=row, column=2, value=change['type'])
+            ws.cell(row=row, column=3, value=change['details'])
+        
+        # 調整欄寬
+        column_widths = [15, 20, 50]
+        for col, width in enumerate(column_widths, 1):
+            ws.column_dimensions[get_column_letter(col)].width = width
+        
+        # 設定文字自動換行
+        for row in range(2, len(self.changes) + 2):
+            for col in range(1, 4):
+                ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical='top')
+    
+    def create_port_stats_sheet(self, wb, header_fill, header_font):
+        """建立 Port 開啟統計工作表"""
+        ws = wb.create_sheet('Port 開啟統計', 3)
+        
+        headers = ['Port 號碼', '服務名稱', '開啟數量', '佔比 (%)']
+        
+        # 寫入標題
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # 計算總數
+        total_ips = len(self.scan_results)
+        if total_ips == 0:
+            total_ips = 1  # 避免除零
+        
+        # 排序 Port 統計（按開啟數量降序）
+        sorted_ports = sorted(self.port_stats.items(), key=lambda x: x[1]['count'], reverse=True)
+        
+        # 寫入數據
+        for row, (port, stats) in enumerate(sorted_ports, 2):
+            count = stats['count']
+            percentage = (count / total_ips) * 100
+            
+            ws.cell(row=row, column=1, value=port)
+            ws.cell(row=row, column=2, value=stats['service'])
+            ws.cell(row=row, column=3, value=count)
+            ws.cell(row=row, column=4, value=f"{percentage:.2f}%")
+        
+        # 調整欄寬
+        column_widths = [15, 25, 15, 15]
+        for col, width in enumerate(column_widths, 1):
+            ws.column_dimensions[get_column_letter(col)].width = width
+        
+        # 設定對齊
+        for row in range(2, len(sorted_ports) + 2):
+            ws.cell(row=row, column=1).alignment = Alignment(horizontal='center')
+            ws.cell(row=row, column=3).alignment = Alignment(horizontal='center')
+            ws.cell(row=row, column=4).alignment = Alignment(horizontal='center')
+    
+    def create_raw_data_sheet(self, wb, header_fill, header_font):
+        """建立詳細資料工作表"""
+        ws = wb.create_sheet('詳細資料', 4)
+        
+        headers = ['IP', '地理位置', 'ISP', 'Port 清單', 'SSL/TLS 狀態', 
+                   '完整 Nmap 輸出', '掃測狀態標記']
+        
+        # 寫入標題
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # 寫入詳細數據
+        for row, result in enumerate(self.scan_results, 2):
+            location = result.get('location', {})
+            location_str = f"{location.get('country', 'N/A')}, {location.get('city', 'N/A')}"
+            isp = location.get('isp', 'N/A')
+            ports_str = ', '.join(map(str, result.get('ports', [])))
+            
+            ssl_status = 'N/A'
+            if result.get('ssl_info'):
+                ssl_status = '已檢查'
+                # 檢查是否有 SSL 問題
+                for port, ssl_data in result['ssl_info'].items():
+                    if isinstance(ssl_data, str) and ('TLSv1.0' in ssl_data or 'TLSv1.1' in ssl_data):
+                        ssl_status = '不合規'
+                        break
+            
+            ws.cell(row=row, column=1, value=result['ip'])
+            ws.cell(row=row, column=2, value=location_str)
+            ws.cell(row=row, column=3, value=isp)
+            ws.cell(row=row, column=4, value=ports_str)
+            ws.cell(row=row, column=5, value=ssl_status)
+            ws.cell(row=row, column=6, value=result.get('raw_output', '')[:5000])  # 限制長度
+            ws.cell(row=row, column=7, value=result.get('status', '正常'))
+        
+        # 調整欄寬
+        column_widths = [15, 25, 30, 30, 15, 60, 20]
+        for col, width in enumerate(column_widths, 1):
+            ws.column_dimensions[get_column_letter(col)].width = width
+        
+        # 設定文字自動換行
+        for row in range(2, len(self.scan_results) + 2):
+            for col in range(1, 8):
+                ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical='top')
+    
     def run(self):
-        print("=" * 70)
-        print("EASM 外部攻擊面掃描系統 - 整合優化版（動態雙階段掃描）")
-        print("=" * 70)
-
-        start_time = time.time()
-        ips = self.load_ip_list()
-        scan_results = self.scan_parallel(ips)
-       
-        if not scan_results:
-            print("[-] 沒有成功的掃描結果")
+        """執行完整掃描流程（多執行緒版本）"""
+        # 讀取目標清單
+        try:
+            with open(self.target_file, 'r', encoding='utf-8') as f:
+                targets = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        except FileNotFoundError:
+            print(f"錯誤：找不到目標檔案 {self.target_file}")
             return
-       
-        # 產生報告
-        print("\n[*] 產生Excel報告...")
-        report_file = self.generate_report(scan_results)
-       
-        elapsed_time = time.time() - start_time
-       
-        print("\n" + "="*60)
-        print(f"掃描完成! 共掃描 {len(scan_results)} 個IP")
-        print(f"總耗時: {elapsed_time:.2f} 秒")
-        print(f"平均每個IP: {elapsed_time/len(scan_results):.2f} 秒")
-        print(f"報告檔案: {report_file}")
-        print("="*60)
+        except Exception as e:
+            print(f"錯誤：讀取目標檔案時發生問題：{e}")
+            return
+        
+        if not targets:
+            print("錯誤：目標清單為空")
+            return
+        
+        print("=" * 70)
+        print(f"EASM 掃描工具 - 兩階段掃描模式 + 多執行緒並行處理")
+        print(f"目標數量：{len(targets)}")
+        print(f"執行緒數：{MAX_WORKERS}")
+        print(f"掃描範圍：Port 1-65535")
+        print(f"報告資料夾：{self.report_dir}")
+        print("=" * 70)
+        
+        # 使用 ThreadPoolExecutor 進行多執行緒掃描
+        completed = 0
+        failed = 0
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # 提交所有掃描任務
+            future_to_target = {
+                executor.submit(self.scan_target, target, i+1, len(targets)): target 
+                for i, target in enumerate(targets)
+            }
+            
+            # 處理完成的任務
+            for future in as_completed(future_to_target):
+                target = future_to_target[future]
+                try:
+                    result = future.result()
+                    completed += 1
+                    print(f"  [✓] [{target}] 掃描完成 ({completed}/{len(targets)})")
+                except KeyboardInterrupt:
+                    print("\n\n掃描已中斷")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                except Exception as e:
+                    failed += 1
+                    print(f"  [✗] [{target}] 掃描失敗：{e} ({completed + failed}/{len(targets)})")
+                    continue
+        
+        print("\n" + "=" * 70)
+        print("掃描完成，正在生成報告...")
+        print(f"  成功：{completed} 個")
+        print(f"  失敗：{failed} 個")
+        print("=" * 70)
+        
+        # 儲存歷史記錄
+        self.save_history()
+        
+        # 生成 Excel 報告
+        report_file = self.generate_excel_report()
+        
+        print(f"\n掃描摘要：")
+        print(f"  - 掃描 IP 數：{len(self.scan_results)}")
+        print(f"  - 發現漏洞數：{len(self.vulnerabilities)}")
+        print(f"  - 變動項目數：{len(self.changes)}")
+        print(f"  - 報告檔案：{report_file}")
 
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="整合版 EASM 掃描器")
-    parser.add_argument("ip_list", help="IP 清單檔案")
-    parser.add_argument("--workers", type=int, default=6, help="並行數 (預設 6)")
-    parser.add_argument("--output", default="scan_results", help="輸出目錄")
-    args = parser.parse_args()
 
-    scanner = EnhancedIPScanner(args.ip_list, args.output, args.workers)
+def main():
+    """主程式入口"""
+    if len(sys.argv) < 2:
+        print("使用方法：python scan.py <目標清單檔案>")
+        print("範例：python scan.py targets.txt")
+        print("範例：python scan.py targets.txt Report")
+        sys.exit(1)
+    
+    target_file = sys.argv[1]
+    if len(sys.argv) >= 3:
+        report_dir = sys.argv[2]
+    else:
+        report_dir = REPORT_DIR_DEFAULT
+
+    scanner = EASMScanner(target_file, report_dir)
     scanner.run()
+
+
+if __name__ == '__main__':
+    main()
